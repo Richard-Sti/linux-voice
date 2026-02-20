@@ -620,6 +620,8 @@ def install_agent():
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>"""
 
+    # Run through /bin/zsh so the process inherits Accessibility permissions
+    # (macOS grants permissions to /bin/zsh, not the Python binary)
     plist_content = f"""\
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -630,9 +632,9 @@ def install_agent():
     <string>com.linux-voice.agent</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{python_path}</string>
-        <string>-u</string>
-        <string>{script_path}</string>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>exec {python_path} -u {script_path}</string>
     </array>
     <key>WorkingDirectory</key>
     <string>{script_path.parent}</string>
