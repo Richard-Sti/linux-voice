@@ -542,6 +542,37 @@ Instruction: {instruction}{context_note}"""
             self.hotkey_pressed = False
             self.stop_recording()
 
+    def _setup_wake_listener(self):
+        """On macOS, exit on wake from sleep so launchd restarts us.
+
+        This is needed because macOS invalidates Accessibility trust
+        tokens after sleep, causing CGEvents to silently fail.
+        A fresh process gets a new valid token.
+        """
+        if sys.platform != "darwin":
+            return
+        try:
+            from AppKit import NSWorkspace, NSWorkspaceDidWakeNotification
+            from PyObjCTools import AppHelper
+            import objc
+
+            def on_wake(_notification):
+                print("System wake detected, restarting...", flush=True)
+                os._exit(0)  # launchd KeepAlive will restart us
+
+            center = NSWorkspace.sharedWorkspace().notificationCenter()
+            center.addObserverForName_object_queue_usingBlock_(
+                NSWorkspaceDidWakeNotification, None, None, on_wake,
+            )
+
+            # Run the notification center on a background thread
+            def run_loop():
+                AppHelper.runConsoleEventLoop()
+
+            threading.Thread(target=run_loop, daemon=True).start()
+        except Exception as e:
+            print(f"Warning: could not set up wake listener: {e}", flush=True)
+
     def run(self):
         # Format hotkey names for display
         hotkey_str = "+".join(m.capitalize() for m in _required_modifier_types) + "+Space"
@@ -553,6 +584,8 @@ Instruction: {instruction}{context_note}"""
         print(f"  {submit_str}: record and submit (press Enter)")
         print(f"  {edit_str}: record correction instruction")
         print("Press Ctrl+C to exit\n")
+
+        self._setup_wake_listener()
 
         try:
             with keyboard.Listener(
