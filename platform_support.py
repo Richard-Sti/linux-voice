@@ -129,25 +129,38 @@ class MacOS(PlatformInterface):
         self._Key = Key
 
     def get_active_app(self):
-        import objc
-        from AppKit import NSWorkspace
+        """Get frontmost app bundle ID using lsappinfo.
 
-        with objc.autorelease_pool():
-            return NSWorkspace.sharedWorkspace().frontmostApplication()
+        NSWorkspace.frontmostApplication() is unreliable when called from
+        pynput's CGEventTap callback thread — it returns the host terminal
+        instead of the actual frontmost app. lsappinfo queries Launch
+        Services directly and works from any thread without extra permissions.
+        """
+        try:
+            result = subprocess.run(
+                "lsappinfo info -only bundleid $(lsappinfo front)",
+                shell=True, capture_output=True, text=True, timeout=2,
+            )
+            # Output format: "bundleid"="com.example.app"
+            output = result.stdout.strip()
+            if "=" in output:
+                return output.split("=", 1)[1].strip('" \n\r')
+            return None
+        except Exception:
+            return None
 
     def restore_focus(self, app_handle):
-        if app_handle is None:
+        """Activate app by bundle identifier using open -b."""
+        if not app_handle:
             return
         try:
-            import objc
-            from AppKit import NSApplicationActivateIgnoringOtherApps
-
-            with objc.autorelease_pool():
-                app_handle.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
-            # Brief sleep to let window manager process the activation
-            time.sleep(0.05)
-        except Exception:
-            pass
+            subprocess.run(
+                ["open", "-b", app_handle],
+                capture_output=True, timeout=2,
+            )
+            time.sleep(0.15)
+        except Exception as e:
+            print(f"\033[91mrestore_focus failed: {e}\033[0m", flush=True)
 
     def _post_key_event(self, keycode, flags=0):
         """Post a keyboard event via CGEvents (goes to frontmost app)."""

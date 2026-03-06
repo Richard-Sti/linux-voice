@@ -292,6 +292,8 @@ Instruction: {instruction}{context_note}"""
         # Capture active window/app for later focus restoration
         try:
             self.active_app = self.platform.get_active_app()
+            if self.active_app:
+                print(f"  [focus] captured: {self.active_app}", flush=True)
         except Exception:
             self.active_app = None
         if edit:
@@ -349,11 +351,11 @@ Instruction: {instruction}{context_note}"""
 
         # Transcribe in background to not block hotkey listener
         threading.Thread(
-            target=self._transcribe_and_type, args=(audio, self.submit_mode, self.edit_mode),
+            target=self._transcribe_and_type, args=(audio, self.submit_mode, self.edit_mode, self.active_app),
             daemon=True,
         ).start()
 
-    def _transcribe_and_type(self, audio: np.ndarray, submit: bool = False, edit: bool = False):
+    def _transcribe_and_type(self, audio: np.ndarray, submit: bool = False, edit: bool = False, active_app=None):
         import time
         t0 = time.time()
         try:
@@ -420,7 +422,9 @@ Instruction: {instruction}{context_note}"""
             self.platform.release_modifiers()
 
             # Restore focus to the original window (may have changed during API call)
-            self.platform.restore_focus(self.active_app)
+            if active_app:
+                print(f"  [focus] restoring: {active_app}", flush=True)
+            self.platform.restore_focus(active_app)
 
             if edit:
                 # Edit mode: use transcription as instruction to correct previous text
@@ -577,9 +581,10 @@ Instruction: {instruction}{context_note}"""
 
     def run(self):
         # Format hotkey names for display
-        hotkey_str = "+".join(m.capitalize() for m in _required_modifier_types) + "+Space"
-        submit_str = "+".join(m.capitalize() for m in _submit_modifier_types) + "+Space"
-        edit_str = "+".join(m.capitalize() for m in _edit_modifier_types) + "+Space"
+        _key_label = _key_name.capitalize()
+        hotkey_str = "+".join(m.capitalize() for m in _required_modifier_types) + f"+{_key_label}"
+        submit_str = "+".join(m.capitalize() for m in _submit_modifier_types) + f"+{_key_label}"
+        edit_str = "+".join(m.capitalize() for m in _edit_modifier_types) + f"+{_key_label}"
 
         print(f"linux-voice started (mode: {MODE}, backend: {BACKEND})")
         print(f"  {hotkey_str}: {'toggle' if MODE == 'toggle' else 'hold to'} record")
@@ -589,12 +594,12 @@ Instruction: {instruction}{context_note}"""
 
         self._setup_wake_listener()
 
+        listener = keyboard.Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+        )
         try:
-            with keyboard.Listener(
-                on_press=self.on_press,
-                on_release=self.on_release,
-            ) as listener:
-                listener.join()
+            listener.start()
         except Exception as e:
             print(f"\033[91mKeyboard listener error: {e}\033[0m")
             if sys.platform == "darwin":
@@ -602,6 +607,14 @@ Instruction: {instruction}{context_note}"""
             else:
                 print("Make sure you're running on X11 with proper permissions.")
             sys.exit(1)
+
+        try:
+            while listener.is_alive():
+                listener.join(timeout=1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            listener.stop()
 
 
 def recover():
