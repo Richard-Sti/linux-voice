@@ -27,6 +27,8 @@ from pynput import keyboard
 
 # Minimum recording duration in seconds (avoid accidental triggers)
 MIN_RECORDING_SECONDS = 0.3
+# Maximum recording duration in seconds (safety timeout)
+MAX_RECORDING_SECONDS = 30
 
 # Load config from ~/.config/linux-voice/config.toml if it exists
 CONFIG = {}
@@ -341,6 +343,40 @@ Instruction: {instruction}{context_note}"""
             )
             self.stream.start()
             self.recording = True
+
+            # Watchdog: poll physical key state to catch missed releases
+            def _watchdog():
+                import time as _time
+                if sys.platform == "darwin":
+                    from Quartz import CGEventSourceKeyState, kCGEventSourceStateHIDSystemState
+                    # Map hotkey key name to macOS virtual keycode
+                    _vk_map = {
+                        "space": 49, "j": 38, "k": 40, "a": 0, "s": 1, "d": 2,
+                        "f": 3, "g": 5, "h": 4, "l": 37, "z": 6, "x": 7, "c": 8,
+                        "v": 9, "b": 11, "n": 45, "m": 46,
+                    }
+                    vk = _vk_map.get(_key_name, None)
+                    if vk is not None:
+                        # Wait a moment for recording to settle
+                        _time.sleep(0.5)
+                        while self.recording:
+                            if not CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, vk):
+                                # Key physically released but we missed the event
+                                print("  [watchdog] key released — stopping", flush=True)
+                                self.hotkey_pressed = False
+                                self.pressed_modifiers.clear()
+                                self.stop_recording()
+                                return
+                            _time.sleep(0.1)
+                        return
+                # Fallback: simple timeout
+                _time.sleep(MAX_RECORDING_SECONDS)
+                if self.recording:
+                    print(f"\033[91m⚠ Recording timeout ({MAX_RECORDING_SECONDS}s) — auto-stopping\033[0m", flush=True)
+                    self.hotkey_pressed = False
+                    self.pressed_modifiers.clear()
+                    self.stop_recording()
+            threading.Thread(target=_watchdog, daemon=True).start()
         except Exception as e:
             self.recording = False
             self.hotkey_pressed = False
@@ -680,6 +716,16 @@ Instruction: {instruction}{context_note}"""
             else:
                 print("Make sure you're running on X11 with proper permissions.")
             sys.exit(1)
+
+        # First Ctrl+C exits gracefully; second one force-quits
+        import signal
+        def _force_exit(signum, frame):
+            print("\n\033[91mForce quit\033[0m")
+            os._exit(1)
+        def _graceful_exit(signum, frame):
+            signal.signal(signal.SIGINT, _force_exit)
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGINT, _graceful_exit)
 
         try:
             while listener.is_alive():
