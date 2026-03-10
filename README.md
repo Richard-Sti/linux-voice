@@ -161,6 +161,7 @@ uv run python linux-voice.py --uninstall-agent
 | `Cmd+Shift+Space` | Hold to record, release to transcribe |
 | `Cmd+Shift+Ctrl+Space` | Record and auto-press Enter |
 | `Cmd+Alt+Space` | Record correction instruction |
+| `Cmd+Shift+K` | Delete last transcription |
 
 ### API Key Setup (Linux)
 
@@ -260,6 +261,21 @@ modifiers = ["ctrl", "alt"]
 # llm_model = "gpt-4o-mini"  # Override LLM model for corrections
 ```
 
+### Delete Hotkey
+
+Use Cmd+Shift+K (macOS) or Ctrl+Shift+K (Linux) to delete the last transcription. This sends backspace keypresses to remove exactly the text that was previously typed.
+
+Configure in `~/.config/linux-voice/config.toml`:
+```toml
+[hotkey_delete]
+key = "k"
+modifiers = ["cmd", "shift"]  # Cmd+Shift+K on macOS
+```
+
+### Auto-spacing
+
+When dictating multiple utterances in a row, a space is automatically prepended between them. The spacing resets when you delete the last transcription or submit with Enter.
+
 ### Offline Recovery
 
 If the internet connection fails during transcription, the audio is saved and you'll see:
@@ -295,8 +311,13 @@ delay = 150                     # ms delay before Enter key
 key = "space"
 modifiers = ["ctrl", "alt"]    # Ctrl+Alt+Space by default
 
+[hotkey_delete]
+key = "k"
+modifiers = ["cmd", "shift"]   # Cmd+Shift+K by default (macOS)
+
 [audio]
 sample_rate = 16000      # Whisper native rate (don't change unless needed)
+input_device = "MacBook Pro Microphone"  # name or index of input device
 silence_threshold = 150  # RMS threshold for silence detection
 
 [transcription]
