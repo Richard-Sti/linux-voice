@@ -41,6 +41,7 @@ if CONFIG_PATH.exists():
 
 # Configuration with defaults
 SAMPLE_RATE = CONFIG.get("audio", {}).get("sample_rate", 16000)  # Whisper native rate
+INPUT_DEVICE = CONFIG.get("audio", {}).get("input_device", "MacBook Pro Microphone")  # name or index
 CHANNELS = 1
 LANGUAGE = CONFIG.get("transcription", {}).get("language", "en")
 PROMPT = CONFIG.get("transcription", {}).get("prompt", "")
@@ -124,6 +125,23 @@ if not EDIT_MODIFIERS:
     EDIT_MODIFIERS = _parse_modifiers(_DEFAULT_EDIT_MODS)
 _edit_modifier_types = set(
     "super" if m == "cmd" else m for m in (_edit_modifier_names or _DEFAULT_EDIT_MODS)
+)
+
+# Delete hotkey - deletes last transcription (Cmd+Shift+D / Ctrl+Shift+D)
+_DEFAULT_DELETE_MODS = ["cmd", "shift"] if _IS_MACOS else ["ctrl", "shift"]
+_delete_cfg = CONFIG.get("hotkey_delete", {})
+_delete_key_name = _delete_cfg.get("key", "k")
+DELETE_KEY = getattr(
+    keyboard.Key,
+    _delete_key_name,
+    keyboard.KeyCode.from_char(_delete_key_name),
+)
+_delete_modifier_names = _delete_cfg.get("modifiers", _DEFAULT_DELETE_MODS)
+DELETE_MODIFIERS = _parse_modifiers(_delete_modifier_names)
+if not DELETE_MODIFIERS:
+    DELETE_MODIFIERS = _parse_modifiers(_DEFAULT_DELETE_MODS)
+_delete_modifier_types = set(
+    "super" if m == "cmd" else m for m in (_delete_modifier_names or _DEFAULT_DELETE_MODS)
 )
 
 # LLM model for corrections (per backend)
@@ -214,7 +232,10 @@ class VoiceRecorder:
         self.submit_mode = False  # Whether to press Enter after typing
         self.edit_mode = False  # Whether to correct last transcription
         self.last_typed_text = ""  # Store for edit mode corrections
+        self.all_typed_text = ""  # All text typed so far (for spacing logic)
         self.active_app = None  # App/window to type into
+        self.delete_pressed = False  # Suppress key repeat for delete
+        self.stray_key_count = 0  # Count of leaked hotkey chars during recording
 
     def _convert_to_mp3(self, audio: np.ndarray) -> io.BytesIO:
         """Convert numpy audio to MP3 using ffmpeg."""
@@ -315,7 +336,7 @@ Instruction: {instruction}{context_note}"""
                 samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
                 dtype=np.int16,
-                device=None,
+                device=INPUT_DEVICE,
                 callback=callback,
             )
             self.stream.start()
@@ -366,8 +387,10 @@ Instruction: {instruction}{context_note}"""
                 recovery_path = Path("/tmp/linux-voice-recovery.wav")
                 if recovery_path.exists():
                     # Don't overwrite - just remind user to recover first
+                    msg = "(no internet - say 'recover' first)"
                     try:
-                        self.platform.type_text("(no internet - say 'recover' first)")
+                        self.platform.type_text(msg)
+                        self.last_typed_text = msg
                     except Exception:
                         pass
                 else:
@@ -377,8 +400,10 @@ Instruction: {instruction}{context_note}"""
                         wf.setframerate(SAMPLE_RATE)
                         wf.writeframes(audio.tobytes())
                     print(f"Audio saved to {recovery_path}")
+                    msg = "(no internet - say 'recover' to retry)"
                     try:
-                        self.platform.type_text("(no internet - say 'recover' to retry)")
+                        self.platform.type_text(msg)
+                        self.last_typed_text = msg
                     except Exception:
                         pass
                 return
@@ -426,6 +451,11 @@ Instruction: {instruction}{context_note}"""
                 print(f"  [focus] restoring: {active_app}", flush=True)
             self.platform.restore_focus(active_app)
 
+            # Clean up stray hotkey characters (e.g. 'j' leaked during hold)
+            if _key_name and len(_key_name) == 1:
+                self.platform.clear_text(self.stray_key_count)
+            self.stray_key_count = 0
+
             if edit:
                 # Edit mode: use transcription as instruction to correct previous text
                 instruction = text
@@ -434,8 +464,8 @@ Instruction: {instruction}{context_note}"""
                 corrected = self._correct_with_llm(self.last_typed_text, instruction)
                 print(f"\033[94m→ {corrected}\033[0m ({time.time()-t0:.1f}s)", flush=True)
 
-                # Clear the current line
-                self.platform.clear_line()
+                # Delete the previously typed text
+                self.platform.clear_text(len(self.last_typed_text))
 
                 # Type corrected text
                 self.platform.type_text(corrected)
@@ -443,16 +473,23 @@ Instruction: {instruction}{context_note}"""
             else:
                 # Normal mode: apply replacements and type
                 text = apply_replacements(text)
+
+                # Auto-add space if continuing after previous text
+                if self.all_typed_text and text:
+                    text = " " + text
+
                 print(f"\033[94m→ {text}\033[0m ({t1-t0:.1f}s)", flush=True)
 
                 self.platform.type_text(text)
                 self.last_typed_text = text
+                self.all_typed_text += text
 
                 # Press Enter if submit mode
                 if submit:
                     import time
                     time.sleep(SUBMIT_DELAY / 1000)
                     self.platform.press_key("Return")
+                    self.all_typed_text = ""
         except Exception as e:
             print(f"\033[91mError: {e}\033[0m")
 
@@ -474,7 +511,7 @@ Instruction: {instruction}{context_note}"""
         print(f"Recovering audio from {recovery_path}...")
 
         # Clear the "no internet" message first
-        self.platform.clear_line()
+        self.platform.clear_text(len(self.last_typed_text))
 
         # Transcribe in background
         threading.Thread(
@@ -487,9 +524,33 @@ Instruction: {instruction}{context_note}"""
 
     def on_press(self, key):
         # Track modifier keys (include all hotkey modifiers)
-        all_modifiers = HOTKEY_MODIFIERS | SUBMIT_MODIFIERS | EDIT_MODIFIERS
+        all_modifiers = HOTKEY_MODIFIERS | SUBMIT_MODIFIERS | EDIT_MODIFIERS | DELETE_MODIFIERS
         if key in all_modifiers:
             self.pressed_modifiers.add(key)
+
+        # Check if delete hotkey is pressed (Cmd+Shift+K)
+        if key == DELETE_KEY and _has_all_modifiers(
+            self.pressed_modifiers, _delete_modifier_types
+        ):
+            if self.delete_pressed:
+                return  # suppress key repeat
+            self.delete_pressed = True
+            if self.last_typed_text:
+                text_to_delete = self.last_typed_text
+                self.last_typed_text = ""
+                self.all_typed_text = ""
+                print(f"\033[93m✕ Deleting: {text_to_delete}\033[0m", flush=True)
+                def _do_delete():
+                    import time as _time
+                    # Wait for user to release modifier keys
+                    _time.sleep(0.3)
+                    self.platform.release_modifiers()
+                    _time.sleep(0.05)
+                    self.platform.clear_text(len(text_to_delete))
+                threading.Thread(target=_do_delete, daemon=True).start()
+            else:
+                print("\033[91mNothing to delete\033[0m", flush=True)
+            return
 
         # Check if edit hotkey is pressed (Ctrl+Alt+Space or configured)
         if key == EDIT_KEY and _has_all_modifiers(
@@ -534,12 +595,22 @@ Instruction: {instruction}{context_note}"""
                 if not self.hotkey_pressed:
                     self.hotkey_pressed = True
                     self.start_recording()
+            return
+
+        # Track stray hotkey characters leaked while recording
+        if self.recording and _key_name and len(_key_name) == 1:
+            if key == keyboard.KeyCode.from_char(_key_name):
+                self.stray_key_count += 1
 
     def on_release(self, key):
         # Track modifier release
-        all_modifiers = HOTKEY_MODIFIERS | SUBMIT_MODIFIERS | EDIT_MODIFIERS
+        all_modifiers = HOTKEY_MODIFIERS | SUBMIT_MODIFIERS | EDIT_MODIFIERS | DELETE_MODIFIERS
         if key in all_modifiers:
             self.pressed_modifiers.discard(key)
+
+        # Reset delete key repeat suppression
+        if key == DELETE_KEY:
+            self.delete_pressed = False
 
         # In hold mode, stop when space is released (works for all hotkeys)
         if MODE == "hold" and key in (HOTKEY_KEY, SUBMIT_KEY, EDIT_KEY) and self.hotkey_pressed:
@@ -585,11 +656,13 @@ Instruction: {instruction}{context_note}"""
         hotkey_str = "+".join(m.capitalize() for m in _required_modifier_types) + f"+{_key_label}"
         submit_str = "+".join(m.capitalize() for m in _submit_modifier_types) + f"+{_key_label}"
         edit_str = "+".join(m.capitalize() for m in _edit_modifier_types) + f"+{_key_label}"
+        delete_str = "+".join(m.capitalize() for m in _delete_modifier_types) + f"+{_delete_key_name.upper()}"
 
         print(f"linux-voice started (mode: {MODE}, backend: {BACKEND})")
         print(f"  {hotkey_str}: {'toggle' if MODE == 'toggle' else 'hold to'} record")
         print(f"  {submit_str}: record and submit (press Enter)")
         print(f"  {edit_str}: record correction instruction")
+        print(f"  {delete_str}: delete last transcription")
         print("Press Ctrl+C to exit\n")
 
         self._setup_wake_listener()

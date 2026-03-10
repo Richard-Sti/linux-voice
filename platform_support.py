@@ -42,8 +42,8 @@ class PlatformInterface(ABC):
         """Release all modifier keys to prevent stuck state."""
 
     @abstractmethod
-    def clear_line(self):
-        """Clear the current input line."""
+    def clear_text(self, length: int):
+        """Delete the last `length` characters (backspace)."""
 
     @abstractmethod
     def check_environment(self) -> list[str]:
@@ -91,8 +91,9 @@ class LinuxX11(PlatformInterface):
             check=False,
         )
 
-    def clear_line(self):
-        subprocess.run(["xdotool", "key", "ctrl+u"], check=False)
+    def clear_text(self, length: int):
+        for _ in range(length):
+            subprocess.run(["xdotool", "key", "BackSpace"], check=False)
 
     def check_environment(self) -> list[str]:
         import os
@@ -250,16 +251,12 @@ class MacOS(PlatformInterface):
             except Exception:
                 pass
 
-    def clear_line(self):
-        """Clear line using Cmd+Delete via CGEvents.
-
-        This is the macOS GUI standard for deleting to beginning of line.
-        Works in most apps. Terminal apps also support Ctrl+U.
-        """
-        from Quartz import kCGEventFlagMaskCommand
-
-        # keycode 51 = Delete, with Cmd flag
-        self._post_key_event(51, flags=kCGEventFlagMaskCommand)
+    def clear_text(self, length: int):
+        """Delete `length` characters by pressing Backspace repeatedly."""
+        import time
+        for _ in range(length):
+            self._post_key_event(51)  # keycode 51 = Delete (Backspace)
+            time.sleep(0.02)
 
     def check_environment(self) -> list[str]:
         errors = []
