@@ -29,7 +29,6 @@ from pynput import keyboard
 MIN_RECORDING_SECONDS = 0.3
 # Maximum recording duration in seconds (safety timeout)
 MAX_RECORDING_SECONDS = 30
-
 # Load config from ~/.config/linux-voice/config.toml if it exists
 CONFIG = {}
 CONFIG_PATH = Path.home() / ".config" / "linux-voice" / "config.toml"
@@ -40,6 +39,9 @@ if CONFIG_PATH.exists():
     except Exception as e:
         print(f"\033[91mConfig error in {CONFIG_PATH}: {e}. Using defaults.\033[0m")
         CONFIG = {}
+
+# Grace period (seconds) before stopping on key release — absorbs brief finger slips
+RELEASE_GRACE_SECONDS = CONFIG.get("hotkey", {}).get("release_grace", 0.5)
 
 # Configuration with defaults
 SAMPLE_RATE = CONFIG.get("audio", {}).get("sample_rate", 16000)  # Whisper native rate
@@ -238,6 +240,9 @@ class VoiceRecorder:
         self.active_app = None  # App/window to type into
         self.delete_pressed = False  # Suppress key repeat for delete
         self.stray_key_count = 0  # Count of leaked hotkey chars during recording
+        self._state_lock = threading.Lock()  # Guards recording state transitions
+        self._debounce_generation = 0  # Incremented on re-press to cancel pending stops
+        self._stop_cooldown = 0.0  # Monotonic time until which start_recording is blocked
 
     def _convert_to_mp3(self, audio: np.ndarray) -> io.BytesIO:
         """Convert numpy audio to MP3 using ffmpeg."""
@@ -304,99 +309,194 @@ Instruction: {instruction}{context_note}"""
             return original  # Return original on error
 
     def start_recording(self, submit=False, edit=False):
-        if self.recording:
-            return
-        if edit and not self.last_typed_text:
-            print("\033[91mNo previous text to edit\033[0m", flush=True)
-            return
-        self.audio_data = []
-        self.submit_mode = submit
-        self.edit_mode = edit
-        # Capture active window/app for later focus restoration
-        try:
-            self.active_app = self.platform.get_active_app()
-            if self.active_app:
-                print(f"  [focus] captured: {self.active_app}", flush=True)
-        except Exception:
-            self.active_app = None
-        if edit:
-            indicator = "● Recording edit instruction..."
-        elif submit:
-            indicator = "● Recording (submit)..."
-        else:
-            indicator = "● Recording..."
-        print(f"\033[92m{indicator}\033[0m", flush=True)
-
-        def callback(indata, frames, time, status):
-            if status:
-                print(f"Audio status: {status}", flush=True)
+        import time as _time
+        with self._state_lock:
             if self.recording:
-                self.audio_data.append(indata.copy())
+                return
+            if _time.monotonic() < self._stop_cooldown:
+                return  # Too soon after last stop — suppress key-repeat restarts
+            if edit and not self.last_typed_text:
+                print("\033[91mNo previous text to edit\033[0m", flush=True)
+                return
+            self.audio_data = []
+            self.submit_mode = submit
+            self.edit_mode = edit
+            # Capture active window/app for later focus restoration
+            try:
+                self.active_app = self.platform.get_active_app()
+                if self.active_app:
+                    print(f"  [focus] captured: {self.active_app}", flush=True)
+            except Exception:
+                self.active_app = None
+            if edit:
+                indicator = "● Recording edit instruction..."
+            elif submit:
+                indicator = "● Recording (submit)..."
+            else:
+                indicator = "● Recording..."
+            print(f"\033[92m{indicator}\033[0m", flush=True)
 
-        try:
-            self.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype=np.int16,
-                device=INPUT_DEVICE,
-                callback=callback,
-            )
-            self.stream.start()
-            self.recording = True
+            def callback(indata, frames, time, status):
+                if status:
+                    print(f"Audio status: {status}", flush=True)
+                if self.recording:
+                    self.audio_data.append(indata.copy())
 
-            # Watchdog: poll physical key state to catch missed releases
-            def _watchdog():
-                import time as _time
-                if sys.platform == "darwin":
-                    from Quartz import CGEventSourceKeyState, kCGEventSourceStateHIDSystemState
-                    # Map hotkey key name to macOS virtual keycode
+            try:
+                self.stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype=np.int16,
+                    device=INPUT_DEVICE,
+                    callback=callback,
+                )
+                self.stream.start()
+                self.recording = True
+            except Exception as e:
+                self._force_reset_state()
+                print(f"\033[91mAudio error: {e}\033[0m", flush=True)
+                return
+
+        # Watchdog: poll physical key state to catch missed releases
+        # (launched outside lock since it's a long-running thread)
+        def _watchdog():
+            import time as _time
+            deadline = _time.monotonic() + MAX_RECORDING_SECONDS
+            use_quartz = False
+            hotkey_vk = None
+            modifier_vks = []
+            if sys.platform == "darwin":
+                try:
+                    from Quartz import CGEventSourceKeyState
+                    # Try combined session state first (survives app focus changes),
+                    # fall back to HID state
+                    try:
+                        from Quartz import kCGEventSourceStateCombinedSessionState
+                        _quartz_state = kCGEventSourceStateCombinedSessionState
+                    except ImportError:
+                        from Quartz import kCGEventSourceStateHIDSystemState
+                        _quartz_state = kCGEventSourceStateHIDSystemState
                     _vk_map = {
                         "space": 49, "j": 38, "k": 40, "a": 0, "s": 1, "d": 2,
                         "f": 3, "g": 5, "h": 4, "l": 37, "z": 6, "x": 7, "c": 8,
                         "v": 9, "b": 11, "n": 45, "m": 46,
                     }
-                    vk = _vk_map.get(_key_name, None)
-                    if vk is not None:
-                        # Wait a moment for recording to settle
-                        _time.sleep(0.5)
-                        while self.recording:
-                            if not CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, vk):
-                                # Key physically released but we missed the event
-                                print("  [watchdog] key released — stopping", flush=True)
-                                self.hotkey_pressed = False
-                                self.pressed_modifiers.clear()
+                    # Modifier virtual keycodes
+                    _mod_vk_map = {
+                        "cmd": [55, 54],      # Left Cmd, Right Cmd
+                        "super": [55, 54],
+                        "shift": [56, 60],    # Left Shift, Right Shift
+                        "ctrl": [59, 62],     # Left Ctrl, Right Ctrl
+                        "alt": [58, 61],      # Left Alt, Right Alt
+                    }
+                    hotkey_vk = _vk_map.get(_key_name, None)
+                    for mod_type in _required_modifier_types:
+                        modifier_vks.extend(_mod_vk_map.get(mod_type, []))
+                    if hotkey_vk is not None or modifier_vks:
+                        use_quartz = True
+                except Exception as e:
+                    print(f"  [watchdog] Quartz unavailable: {e}", flush=True)
+
+            # Wait a moment for recording to settle
+            _time.sleep(0.5)
+            while self.recording:
+                if _time.monotonic() >= deadline:
+                    print(f"\033[91m⚠ Recording timeout ({MAX_RECORDING_SECONDS}s) — auto-stopping\033[0m", flush=True)
+                    self.stop_recording()
+                    return
+                if use_quartz:
+                    try:
+                        key_up = hotkey_vk is not None and not CGEventSourceKeyState(_quartz_state, hotkey_vk)
+                        mods_up = modifier_vks and not any(
+                            CGEventSourceKeyState(_quartz_state, mvk) for mvk in modifier_vks
+                        )
+                        if key_up and mods_up:
+                            # Both main key AND modifiers released — wait grace, then stop
+                            _time.sleep(RELEASE_GRACE_SECONDS)
+                            still_key_up = hotkey_vk is not None and not CGEventSourceKeyState(_quartz_state, hotkey_vk)
+                            still_mods_up = modifier_vks and not any(
+                                CGEventSourceKeyState(_quartz_state, mvk) for mvk in modifier_vks
+                            )
+                            if still_key_up and still_mods_up and self.recording:
+                                print("  [watchdog] key+modifiers released — stopping", flush=True)
                                 self.stop_recording()
                                 return
-                            _time.sleep(0.1)
-                        return
-                # Fallback: simple timeout
-                _time.sleep(MAX_RECORDING_SECONDS)
-                if self.recording:
-                    print(f"\033[91m⚠ Recording timeout ({MAX_RECORDING_SECONDS}s) — auto-stopping\033[0m", flush=True)
-                    self.hotkey_pressed = False
-                    self.pressed_modifiers.clear()
-                    self.stop_recording()
-            threading.Thread(target=_watchdog, daemon=True).start()
-        except Exception as e:
-            self.recording = False
-            self.hotkey_pressed = False
-            print(f"\033[91mAudio error: {e}\033[0m", flush=True)
+                    except Exception as e:
+                        print(f"  [watchdog] Quartz error: {e} — falling back to timeout", flush=True)
+                        use_quartz = False
+                _time.sleep(0.1)
+        threading.Thread(target=_watchdog, daemon=True).start()
 
-    def stop_recording(self):
-        if not self.recording:
-            return
+    def _force_reset_state(self):
+        """Unconditionally reset all recording state. Call when things go wrong."""
         self.recording = False
+        self.hotkey_pressed = False
+        self.pressed_modifiers.clear()
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
+            try:
+                self.stream.stop()
+            except Exception:
+                pass
+            try:
+                self.stream.close()
+            except Exception:
+                pass
             self.stream = None
 
-        if not self.audio_data:
+    def _debounced_stop(self, key):
+        """Schedule a stop after a grace period; cancelled if the key is re-pressed."""
+        self._debounce_generation += 1
+        gen = self._debounce_generation
+        print(f"  [debounce] release detected (gen={gen}), waiting {RELEASE_GRACE_SECONDS}s...", flush=True)
+
+        def _check():
+            import time as _time
+            _time.sleep(RELEASE_GRACE_SECONDS)
+            # If generation changed, the key was re-pressed — cancel this stop
+            if self._debounce_generation != gen:
+                print(f"  [debounce] gen={gen} cancelled (now={self._debounce_generation}) — kept recording", flush=True)
+                return
+            # Key is still released — actually stop
+            if self.recording:
+                print("  [debounce] confirmed release — stopping", flush=True)
+                self.stop_recording()
+
+        threading.Thread(target=_check, daemon=True).start()
+
+    def stop_recording(self):
+        import time as _time
+        with self._state_lock:
+            if not self.recording:
+                return
+            self.recording = False
+            self.hotkey_pressed = False  # Always reset so next press works
+            # Block restarts from key-repeat for 1 second
+            self._stop_cooldown = _time.monotonic() + 1.0
+            stream = self.stream
+            self.stream = None
+            audio_chunks = self.audio_data  # Capture before next start_recording clears it
+            self.audio_data = []
+            submit_mode = self.submit_mode
+            edit_mode = self.edit_mode
+            active_app = self.active_app
+
+        # Close stream outside lock (may block briefly)
+        if stream:
+            try:
+                stream.stop()
+            except Exception as e:
+                print(f"\033[91mStream stop error: {e}\033[0m", flush=True)
+            try:
+                stream.close()
+            except Exception as e:
+                print(f"\033[91mStream close error: {e}\033[0m", flush=True)
+
+        if not audio_chunks:
             print("No audio recorded")
             return
 
         # Combine audio chunks
-        audio = np.concatenate(self.audio_data, axis=0)
+        audio = np.concatenate(audio_chunks, axis=0)
 
         # Check minimum duration
         duration = len(audio) / SAMPLE_RATE
@@ -408,7 +508,7 @@ Instruction: {instruction}{context_note}"""
 
         # Transcribe in background to not block hotkey listener
         threading.Thread(
-            target=self._transcribe_and_type, args=(audio, self.submit_mode, self.edit_mode, self.active_app),
+            target=self._transcribe_and_type, args=(audio, submit_mode, edit_mode, active_app),
             daemon=True,
         ).start()
 
@@ -598,6 +698,7 @@ Instruction: {instruction}{context_note}"""
                 else:
                     self.start_recording(edit=True)
             else:  # hold mode
+                self._debounce_generation += 1  # cancel any pending debounced stop
                 if not self.hotkey_pressed:
                     self.hotkey_pressed = True
                     self.start_recording(edit=True)
@@ -613,6 +714,7 @@ Instruction: {instruction}{context_note}"""
                 else:
                     self.start_recording(submit=True)
             else:  # hold mode
+                self._debounce_generation += 1  # cancel any pending debounced stop
                 if not self.hotkey_pressed:
                     self.hotkey_pressed = True
                     self.start_recording(submit=True)
@@ -628,6 +730,7 @@ Instruction: {instruction}{context_note}"""
                 else:
                     self.start_recording()
             else:  # hold mode
+                self._debounce_generation += 1  # cancel any pending debounced stop
                 if not self.hotkey_pressed:
                     self.hotkey_pressed = True
                     self.start_recording()
@@ -648,10 +751,10 @@ Instruction: {instruction}{context_note}"""
         if key == DELETE_KEY:
             self.delete_pressed = False
 
-        # In hold mode, stop when space is released (works for all hotkeys)
-        if MODE == "hold" and key in (HOTKEY_KEY, SUBMIT_KEY, EDIT_KEY) and self.hotkey_pressed:
-            self.hotkey_pressed = False
-            self.stop_recording()
+        # In hold mode, stop when hotkey is released — with grace period for finger slips
+        if MODE == "hold" and key in (HOTKEY_KEY, SUBMIT_KEY, EDIT_KEY):
+            if self.hotkey_pressed or self.recording:
+                self._debounced_stop(key)
 
     def _setup_wake_listener(self):
         """On macOS, exit on wake from sleep so launchd restarts us.
