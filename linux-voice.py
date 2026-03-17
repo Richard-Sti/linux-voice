@@ -315,6 +315,9 @@ Instruction: {instruction}{context_note}"""
             if edit and not self.last_typed_text:
                 print("\033[91mNo previous text to edit\033[0m", flush=True)
                 return False
+            # Set recording=True optimistically so debounce/release logic works
+            # even while the stream is being opened in the background.
+            self.recording = True
             self.audio_data = []
             self.submit_mode = submit
             self.edit_mode = edit
@@ -333,36 +336,46 @@ Instruction: {instruction}{context_note}"""
                 indicator = "● Recording..."
             print(f"\033[92m{indicator}\033[0m", flush=True)
 
-        # Open audio stream OUTSIDE the lock — PortAudio can hang here if
-        # a previous stream didn't close cleanly, and we must not hold the
-        # lock while that happens (it would freeze the keyboard listener).
-        def callback(indata, frames, time, status):
-            if status:
-                print(f"Audio status: {status}", flush=True)
-            if self.recording:
-                self.audio_data.append(indata.copy())
-
-        try:
-            stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype=np.int16,
-                device=INPUT_DEVICE,
-                callback=callback,
-            )
-            stream.start()
-        except Exception as e:
-            self._force_reset_state()
-            print(f"\033[91mAudio error: {e}\033[0m", flush=True)
-            return False
-
-        with self._state_lock:
-            self.stream = stream
-            self.recording = True
-
-        # Watchdog: safety timeout only (release detection is handled by debounce)
-        def _watchdog():
+        # Open audio stream and run watchdog in a BACKGROUND THREAD — PortAudio
+        # can hang if a previous stream didn't close cleanly.  Running this off
+        # the pynput listener thread keeps keyboard events (including panic
+        # reset) responsive.
+        def _open_and_watch():
             import time as _time
+
+            def callback(indata, frames, time, status):
+                if status:
+                    print(f"Audio status: {status}", flush=True)
+                if self.recording:
+                    self.audio_data.append(indata.copy())
+
+            try:
+                stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype=np.int16,
+                    device=INPUT_DEVICE,
+                    callback=callback,
+                )
+                stream.start()
+            except Exception as e:
+                print(f"\033[91mAudio error: {e}\033[0m", flush=True)
+                self._force_reset_state()
+                return
+
+            # Assign stream under lock — if recording was already stopped
+            # while we were opening, close the stream to avoid leaking it.
+            with self._state_lock:
+                if not self.recording:
+                    try:
+                        stream.stop()
+                        stream.close()
+                    except Exception:
+                        pass
+                    return
+                self.stream = stream
+
+            # Watchdog: safety timeout
             deadline = _time.monotonic() + MAX_RECORDING_SECONDS
             while self.recording:
                 if _time.monotonic() >= deadline:
@@ -374,7 +387,8 @@ Instruction: {instruction}{context_note}"""
                     self.stop_recording()
                     return
                 _time.sleep(1)
-        threading.Thread(target=_watchdog, daemon=True).start()
+
+        threading.Thread(target=_open_and_watch, daemon=True).start()
         return True
 
     def _force_reset_state(self):
@@ -447,7 +461,11 @@ Instruction: {instruction}{context_note}"""
             t.start()
             t.join(timeout=2.0)
             if t.is_alive():
-                print("\033[91m⚠ Stream close timed out — continuing anyway\033[0m", flush=True)
+                print("\033[91m⚠ Stream close timed out — audio device stuck, restarting process\033[0m", flush=True)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+                os._exit(1)  # fallback if execv fails
 
         if not audio_chunks:
             print("No audio recorded")
@@ -646,14 +664,17 @@ Instruction: {instruction}{context_note}"""
                 print("\033[91mNothing to delete\033[0m", flush=True)
             return
 
-        # Panic reset: Cmd+Esc (macOS) or Ctrl+Esc (Linux) — force-reset when stuck
+        # Panic reset: Cmd+Shift+Esc (macOS) or Ctrl+Shift+Esc (Linux)
+        # Restarts the entire process to recover from broken PortAudio state.
         if key == keyboard.Key.esc and _has_all_modifiers(
             self.pressed_modifiers,
-            {"super"} if _IS_MACOS else {"ctrl"},
+            {"super", "shift"} if _IS_MACOS else {"ctrl", "shift"},
         ):
-            print("\033[93m⚠ Panic reset — clearing all state\033[0m", flush=True)
-            self._force_reset_state()
-            return
+            print("\033[93m⚠ Panic reset — restarting process\033[0m", flush=True)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+            os._exit(1)  # fallback if execv fails
 
         # Check if edit hotkey is pressed (Ctrl+Alt+Space or configured)
         if key == EDIT_KEY and _has_all_modifiers(
@@ -768,7 +789,7 @@ Instruction: {instruction}{context_note}"""
         print(f"  {hotkey_str}: {'toggle' if MODE == 'toggle' else 'hold to'} record")
         print(f"  {submit_str}: record and submit (press Enter)")
         print(f"  {edit_str}: record correction instruction")
-        panic_str = "Cmd+Esc" if _IS_MACOS else "Ctrl+Esc"
+        panic_str = "Cmd+Shift+Esc" if _IS_MACOS else "Ctrl+Shift+Esc"
         print(f"  {delete_str}: delete last transcription")
         print(f"  {panic_str}: panic reset (unstick)")
         print("Press Ctrl+C to exit\n")
